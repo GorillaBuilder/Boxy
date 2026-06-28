@@ -1,0 +1,124 @@
+/* Paper aesthetic: cream page, serif display, sans body, ruler-tick edges, soft windows */
+@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { cursor: none; }
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: #fdfcf7;
+  color: #1a1a1a;
+  font-family: Inter, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.011em;
+  overflow: hidden;
+}
+
+/* ---- subtle paper texture ---- */
+.paper-bg {
+  background-color: #fdfcf7;
+  background-image:
+    radial-gradient(rgba(0,0,0,0.018) 1px, transparent 1px),
+    radial-gradient(rgba(0,0,0,0.012) 1px, transparent 1px);
+  background-size: 4px 4px, 7px 7px;
+  background-position: 0 0, 2px 3px;
+}
+
+/* ---- ruler-tick edges (right margin like paper.design) ---- */
+.ruler-right {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(0,0,0,0.18) 0 1px,
+    transparent 1px 8px,
+    rgba(0,0,0,0.10) 8px 9px,
+    transparent 9px 16px
+  );
+  background-size: 6px 100%;
+  background-position: right top;
+  background-repeat: no-repeat;
+}
+
+/* grid bg for hero / canvas blocks */
+.grid-paper {
+  background-image:
+    linear-gradient(rgba(0,0,0,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,0,0,0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* ---- custom cursor (subtle, dark on cream) ---- */
+.boxy-cursor {
+  position: fixed; top: 0; left: 0; z-index: 9999;
+  pointer-events: none; opacity: 0;
+  transition: opacity 0.2s ease, width 0.18s, height 0.18s;
+  will-change: transform;
+}
+.boxy-cursor.ready { opacity: 1; }
+.boxy-cursor .dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: #1a1a1a; transform: translate(-50%, -50%);
+}
+.boxy-cursor .ring {
+  position: absolute; top: 50%; left: 50%;
+  width: 24px; height: 24px; border: 1px solid rgba(26,26,26,0.45);
+  border-radius: 50%; transform: translate(-50%, -50%);
+  transition: width 0.18s cubic-bezier(0.2,0,0,1), height 0.18s, opacity 0.18s, border-color 0.18s;
+}
+.boxy-cursor.hot .ring { width: 38px; height: 38px; border-color: rgba(26,26,26,0.7); }
+.boxy-cursor.text .ring { width: 3px; height: 22px; border-radius: 2px; }
+
+@media (hover: none), (pointer: coarse) {
+  * { cursor: auto; }
+  .boxy-cursor { display: none; }
+}
+
+/* ---- micro UI primitives ---- */
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg border border-paper-300 bg-paper-100
+           px-3 py-1.5 text-xs font-medium text-paper-900 transition-all duration-150 ease-paper;
+  }
+  .btn:hover { @apply border-paper-400 bg-paper-200; }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg bg-ink px-3.5 py-2
+           text-xs font-semibold text-paper-50 transition-all duration-150 ease-paper;
+  }
+  .btn-primary:hover { filter: brightness(1.12); transform: translateY(-0.5px); }
+  .btn-primary:disabled { opacity: 0.45; cursor: none; }
+  .btn-ghost {
+    @apply inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-paper-500
+           transition-colors duration-150 hover:bg-paper-200 hover:text-paper-900;
+  }
+  .chip {
+    @apply rounded-md border border-paper-300 bg-paper-100 px-2 py-0.5 text-2xs font-medium text-paper-500;
+  }
+  .panel {
+    @apply rounded-xl border border-paper-300 bg-paper-100;
+  }
+  .input {
+    @apply w-full rounded-lg border border-paper-300 bg-paper-50 px-3 py-2 text-sm text-paper-900
+           outline-none transition-colors duration-150 placeholder:text-paper-400 focus:border-paper-500;
+  }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.10); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.18); background-clip: padding-box; }
+
+.fade-up { animation: fadeUp 0.5s cubic-bezier(0.2,0,0,1) both; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* ---- Paper-style window frame (used in mockups) ---- */
+.window-frame {
+  @apply rounded-xl border border-paper-300 bg-paper-50 shadow-window overflow-hidden;
+}
+.window-titlebar {
+  @apply flex items-center gap-1.5 border-b border-paper-300 bg-paper-100 px-3 py-2 text-2xs text-paper-500;
+}
+.window-titlebar .dot { @apply h-2.5 w-2.5 rounded-full bg-paper-300; }
+
+/* serif display helper */
+.display { font-family: 'Instrument Serif', Georgia, serif; letter-spacing: -0.02em; line-height: 1; }

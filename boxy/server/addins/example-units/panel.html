@@ -1,0 +1,40 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Cost</title>
+<style>
+  body { font: 13px Inter, system-ui, sans-serif; color: #1a1a1a; background: #f7f4ea; margin: 0; padding: 12px; }
+  label { display: block; font-size: 11px; color: #8a8675; margin-top: 8px; }
+  input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #e3dcc8; border-radius: 6px; background: #fdfcf7; font: inherit; }
+  button { margin-top: 12px; padding: 7px 12px; background: #1a1a1a; color: #fdfcf7; border: 0; border-radius: 6px; font: inherit; font-weight: 600; cursor: pointer; }
+  .out { margin-top: 10px; padding: 8px 10px; background: #fdfcf7; border: 1px solid #e3dcc8; border-radius: 6px; }
+</style></head>
+<body>
+  <strong>PLA cost estimate</strong>
+  <label>X (mm)</label><input id="x" value="80" />
+  <label>Y (mm)</label><input id="y" value="40" />
+  <label>Z (mm)</label><input id="z" value="20" />
+  <label>Infill</label><input id="inf" value="0.2" />
+  <button onclick="go()">Estimate</button>
+  <div id="out" class="out" style="display:none"></div>
+<script>
+  // Addin panels talk to the parent app via postMessage. The host responds with the
+  // tool result. Host code lives in client/src/components/AddinPanel.tsx.
+  function call(tool, args) {
+    return new Promise((resolve) => {
+      const reqId = Math.random().toString(36).slice(2);
+      const handler = (e) => {
+        if (e.data?.boxy_reply !== reqId) return;
+        window.removeEventListener('message', handler);
+        resolve(e.data.result);
+      };
+      window.addEventListener('message', handler);
+      parent.postMessage({ boxy_call: reqId, tool, args }, '*');
+    });
+  }
+  async function go() {
+    const size_mm = [+x.value, +y.value, +z.value];
+    const v = await call('example-units.estimate_volume', { size_mm });
+    const c = await call('example-units.estimate_pla_cost', { volume_cm3: v.volume_cm3, infill: +inf.value });
+    out.style.display = 'block';
+    out.innerHTML = `Volume: <b>${v.volume_cm3} cm³</b><br/>Mass: <b>${c.grams} g</b><br/>Cost: <b>$${c.usd}</b>`;
+  }
+</script></body></html>
