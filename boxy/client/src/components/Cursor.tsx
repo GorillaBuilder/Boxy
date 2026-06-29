@@ -1,27 +1,44 @@
 import { useEffect, useRef } from 'react';
 
+// Custom pointer cursor. Renders an inline SVG that follows the mouse with
+// smoothing (lerp). Hides on page leave. Skipped entirely when any ancestor
+// of the hovered element has data-cursor="off" (used on the login page so
+// it doesn't sit on top of the Google G icon).
 export default function Cursor() {
   const ref = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     const el = ref.current!;
     el.style.transform = 'translate(-100px, -100px)';
-    let raf = 0, x = -100, y = -100, tx = -100, ty = -100, ready = false;
+    let raf = 0;
+    let x = -100, y = -100, tx = -100, ty = -100;
+    let ready = false;
+
     const move = (e: MouseEvent) => {
       tx = e.clientX; ty = e.clientY;
       if (!ready) { ready = true; x = tx; y = ty; el.classList.add('ready'); }
+
       const t = e.target as HTMLElement;
-      const interactive = t.closest('button, a, [role="button"], .btn, .btn-primary, .btn-ghost, input, textarea');
-      el.classList.toggle('hot', !!t.closest('button, a, [role="button"], .btn, .btn-primary, .btn-ghost'));
-      el.classList.toggle('text', !!t.closest('input, textarea'));
-      if (!interactive) el.classList.remove('text');
+      // honour an opt-out anywhere up the tree
+      if (t.closest?.('[data-cursor="off"]')) {
+        el.classList.add('hidden-cursor');
+      } else {
+        el.classList.remove('hidden-cursor');
+      }
+      // subtle scale-up over interactive elements
+      const interactive = t.closest?.('button, a, [role="button"], .btn, .btn-primary, .btn-ghost, input, textarea');
+      el.classList.toggle('hot', !!interactive && !t.closest?.('input, textarea'));
     };
     const leave = () => el.classList.remove('ready');
     const enter = () => { if (ready) el.classList.add('ready'); };
+
     const loop = () => {
-      x += (tx - x) * 0.25; y += (ty - y) * 0.25;
+      x += (tx - x) * 0.28;
+      y += (ty - y) * 0.28;
       el.style.transform = `translate(${x}px, ${y}px)`;
       raf = requestAnimationFrame(loop);
     };
+
     window.addEventListener('mousemove', move);
     document.addEventListener('mouseleave', leave);
     document.addEventListener('mouseenter', enter);
@@ -33,10 +50,31 @@ export default function Cursor() {
       cancelAnimationFrame(raf);
     };
   }, []);
+
+  // The wrapping div is what gets translated. The SVG inside is positioned
+  // so the arrow TIP sits at the wrapper's origin (the actual click point).
+  // For the SVG below, the tip is near (4, 3) in its 24×24 viewBox; at 22px
+  // render size that's about (3.7, 2.7) px — close enough to (0,0) that we
+  // nudge it with a small translate so the tip lands exactly on the cursor point.
   return (
     <div ref={ref} className="boxy-cursor">
-      <div className="ring" />
-      <div className="dot" />
+      <svg
+        width="22"
+        height="22"
+        viewBox="0 0 24 24"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        style={{ transform: 'translate(-3px, -2px)' }}
+      >
+        <path
+          d="M17.2607 12.4008C19.3774 11.2626 20.4357 10.6935 20.7035 10.0084C20.9359 9.41393 20.8705 8.74423 20.5276 8.20587C20.1324 7.58551 18.984 7.23176 16.6872 6.52425L8.00612 3.85014C6.06819 3.25318 5.09923 2.95471 4.45846 3.19669C3.90068 3.40733 3.46597 3.85584 3.27285 4.41993C3.051 5.06794 3.3796 6.02711 4.03681 7.94545L6.94793 16.4429C7.75632 18.8025 8.16052 19.9824 8.80519 20.3574C9.36428 20.6826 10.0461 20.7174 10.6354 20.4507C11.3149 20.1432 11.837 19.0106 12.8813 16.7454L13.6528 15.0719C13.819 14.7113 13.9021 14.531 14.0159 14.3736C14.1168 14.2338 14.2354 14.1078 14.3686 13.9984C14.5188 13.8752 14.6936 13.7812 15.0433 13.5932L17.2607 12.4008Z"
+          fill="#1a1a1a"
+          stroke="#1a1a1a"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
     </div>
   );
 }

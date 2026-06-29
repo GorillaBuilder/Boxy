@@ -1,211 +1,189 @@
-// Minimal MCP-style server: JSON-RPC over HTTP for tools that operate on a Boxy design.
-// Lets external agents (Claude Desktop, custom MCP clients) drive Boxy.
-//
-// Endpoints:
-//   POST  /mcp/v1/rpc        { jsonrpc, id, method, params }   (single call)
-//   GET   /mcp/v1/sse        server-sent events for live updates
-//   GET   /mcp/v1/manifest   list of tools (built-in + addin-registered)
-//
-// Auth: API key in header `x-boxy-key` mapped 1:1 to a user. Generated per-user from the UI.
+// MCP (Model Context Protocol) server. JSON-RPC 2.0 over HTTP + SSE.
+// Authenticated by API key in the x-boxy-key header.
 
-import { nanoid } from 'nanoid';
-import { store } from './db.js';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import { readdir, stat } from 'fs/promises';
+import {
+  supabase,
+  findKey, bumpKey,
+  listDesigns, getDesign, insertDesign, updateDesign,
+  listMessages, insertMessage,
+} from './db.js';
 
-const subscribers = new Map(); // designId -> Set<res>
-const apiKeys = new Map();     // key -> userId  (in-memory; persisted to store on first set)
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// Hydrate api keys from store at boot
-function loadKeys() {
-  const all = store.listApiKeys?.() || [];
-  for (const k of all) apiKeys.set(k.key, k.userId);
+// ─────────────────────── tool registry ───────────────────────
+const tools = new Map(); // name → { description, input, run }
+const addins = [];       // [{ id, name, description, version, panel }]
+
+export function registerTool(t) { tools.set(t.name, t); }
+export function getTool(name) { return tools.get(name); }
+export function getManifest() {
+  return {
+    tools: Array.from(tools.entries()).map(([name, t]) => ({
+      name, description: t.description, input: t.input,
+    })),
+    addins,
+  };
 }
-loadKeys();
 
-/* ----- tool registry (built-in + addin-registered) ----- */
-const tools = new Map();
-
-function registerTool(spec) {
-  tools.set(spec.name, spec);
-}
-
-// Built-in tools — these are the surface external agents see.
+// ─────────────────────── core tools ──────────────────────────
 registerTool({
   name: 'design.list',
-  description: 'List all of the user\'s designs.',
+  description: 'List designs owned by the authenticated user.',
   input: { type: 'object', properties: {} },
-  run: async ({ userId }) => store.listDesigns(userId),
+  run: async ({ userId }) => await listDesigns(userId),
 });
 registerTool({
   name: 'design.get',
-  description: 'Get a design and its current DSL program + messages.',
-  input: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
+  description: 'Get a design (with ops + messages).',
+  input: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
   run: async ({ userId, params }) => {
-    const d = store.getDesign(params.id, userId);
+    const d = await getDesign(params.id, userId);
     if (!d) throw new Error('not found');
-    return { design: d, messages: store.listMessages(d.id) };
+    return { design: d, messages: await listMessages(d.id) };
   },
 });
 registerTool({
   name: 'design.create',
   description: 'Create a new design.',
   input: { type: 'object', properties: { title: { type: 'string' } } },
-  run: async ({ userId, params }) => store.insertDesign(userId, params.title || 'Untitled'),
+  run: async ({ userId, params }) =>
+    await insertDesign(userId, params?.title || 'Untitled design'),
 });
 registerTool({
   name: 'design.append_ops',
-  description: 'Append BoxyDSL ops to a design. The canvas updates live.',
-  input: { type: 'object', required: ['id', 'ops'], properties: {
-    id: { type: 'string' }, ops: { type: 'array' },
-  } },
+  description: 'Append BoxyDSL ops to a design.',
+  input: {
+    type: 'object',
+    properties: { id: { type: 'string' }, ops: { type: 'array' } },
+    required: ['id', 'ops'],
+  },
   run: async ({ userId, params }) => {
-    const d = store.getDesign(params.id, userId);
+    const d = await getDesign(params.id, userId);
     if (!d) throw new Error('not found');
     const current = JSON.parse(d.dsl || '[]');
-    const next = [...current, ...params.ops];
-    store.updateDesign(d.id, { dsl: JSON.stringify(next) });
-    broadcast(d.id, { type: 'ops_appended', ops: params.ops });
+    const next = current.concat(params.ops || []);
+    await updateDesign(d.id, { dsl: JSON.stringify(next) });
     return { count: next.length };
   },
 });
 registerTool({
   name: 'design.replace_ops',
-  description: 'Replace the entire BoxyDSL program for a design.',
-  input: { type: 'object', required: ['id', 'ops'], properties: {
-    id: { type: 'string' }, ops: { type: 'array' },
-  } },
+  description: 'Replace a design\'s ops wholesale.',
+  input: {
+    type: 'object',
+    properties: { id: { type: 'string' }, ops: { type: 'array' } },
+    required: ['id', 'ops'],
+  },
   run: async ({ userId, params }) => {
-    const d = store.getDesign(params.id, userId);
+    const d = await getDesign(params.id, userId);
     if (!d) throw new Error('not found');
-    store.updateDesign(d.id, { dsl: JSON.stringify(params.ops) });
-    broadcast(d.id, { type: 'ops_replaced', ops: params.ops });
-    return { count: params.ops.length };
+    await updateDesign(d.id, { dsl: JSON.stringify(params.ops || []) });
+    return { count: (params.ops || []).length };
   },
 });
 registerTool({
   name: 'design.snapshot',
-  description: 'Get the last rendered thumbnail (data URL) for the design.',
-  input: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
+  description: 'Get the last persisted thumbnail of a design (data URL).',
+  input: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
   run: async ({ userId, params }) => {
-    const d = store.getDesign(params.id, userId);
+    const d = await getDesign(params.id, userId);
     if (!d) throw new Error('not found');
     return { thumbnail: d.thumbnail || null };
   },
 });
 
-/* ----- addin loader -----
- * Addins are JS modules dropped into server/addins/<name>/index.js that export:
- *   export default {
- *     id: 'my-addin',
- *     name: 'My Addin',
- *     panel?: { url: '/addins/my-addin/panel.html' },   // optional UI panel
- *     tools: [ { name, description, input, run } ]
- *   }
- * They're loaded at boot. UI panel manifest is exposed to the client.
- */
-import { readdirSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const ADDINS_DIR = join(__dirname, '..', 'addins');
-
-const addins = [];
-
+// ─────────────────────── addin loader ────────────────────────
 export async function loadAddins() {
-  if (!existsSync(ADDINS_DIR)) return;
-  const dirs = readdirSync(ADDINS_DIR, { withFileTypes: true }).filter(d => d.isDirectory());
-  for (const dir of dirs) {
-    const entry = join(ADDINS_DIR, dir.name, 'index.js');
-    if (!existsSync(entry)) continue;
+  const addinsDir = join(__dirname, '..', 'addins');
+  let entries;
+  try { entries = await readdir(addinsDir); } catch { return; }
+  for (const id of entries) {
+    const full = join(addinsDir, id);
+    let s; try { s = await stat(full); } catch { continue; }
+    if (!s.isDirectory()) continue;
+    const indexPath = join(full, 'index.js');
     try {
-      const mod = await import(pathToFileURL(entry).href);
+      const mod = await import(`file://${indexPath}`);
       const addin = mod.default;
-      if (!addin?.id) continue;
-      addins.push(addin);
-      for (const tool of addin.tools || []) {
-        registerTool({ ...tool, name: `${addin.id}.${tool.name}`, addin: addin.id });
+      if (!addin || !addin.id) continue;
+      addins.push({
+        id: addin.id, name: addin.name || addin.id,
+        description: addin.description || '',
+        version: addin.version, panel: addin.panel,
+      });
+      for (const t of addin.tools || []) {
+        registerTool({
+          name: `${addin.id}.${t.name}`,
+          description: t.description, input: t.input,
+          run: t.run,
+        });
       }
-      console.log(`[addin] loaded ${addin.id} (${addin.tools?.length || 0} tools)`);
+      console.log(`  · loaded addin ${addin.id} (${(addin.tools || []).length} tools)`);
     } catch (e) {
-      console.error(`[addin] failed to load ${dir.name}:`, e.message);
+      console.warn(`  · failed to load addin ${id}:`, e.message);
     }
   }
 }
 
-export function getAddins() { return addins; }
-export function getTool(name) { return tools.get(name); }
-export function getManifest() {
-  return {
-    tools: Array.from(tools.values()).map(({ name, description, input, addin }) => ({
-      name, description, input, addin: addin || 'core',
-    })),
-    addins: addins.map(a => ({ id: a.id, name: a.name, panel: a.panel || null })),
-  };
+// ─────────────────────── HTTP / RPC ──────────────────────────
+// SSE connections keyed by user id, for live updates back to MCP clients.
+const sseClients = new Map(); // userId → Set<res>
+
+export function broadcast(userId, event, data) {
+  const set = sseClients.get(userId);
+  if (!set) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of set) { try { res.write(payload); } catch {} }
 }
 
-/* ----- SSE broadcast (for live canvas updates from external agents) ----- */
-function broadcast(designId, payload) {
-  const subs = subscribers.get(designId);
-  if (!subs) return;
-  const line = `data: ${JSON.stringify(payload)}\n\n`;
-  for (const res of subs) try { res.write(line); } catch {}
+async function authByKey(req, res) {
+  const key = req.headers['x-boxy-key'];
+  if (!key) { res.status(401).json({ error: 'missing x-boxy-key' }); return null; }
+  const row = await findKey(key);
+  if (!row) { res.status(401).json({ error: 'invalid key' }); return null; }
+  bumpKey(key).catch(() => {});
+  return row.user_id;
 }
 
-/* ----- key management (called from auth-protected /api routes) ----- */
-export function createApiKey(userId) {
-  const key = 'bxy_' + nanoid(28);
-  apiKeys.set(key, userId);
-  store.insertApiKey?.({ key, userId });
-  return key;
-}
-export function listApiKeysForUser(userId) {
-  return (store.listApiKeys?.() || []).filter(k => k.userId === userId);
-}
-export function revokeApiKey(userId, key) {
-  if (apiKeys.get(key) !== userId) return false;
-  apiKeys.delete(key);
-  store.deleteApiKey?.(key);
-  return true;
-}
-
-/* ----- express wiring ----- */
 export function mountMcp(app) {
-  app.get('/mcp/v1/manifest', (req, res) => res.json(getManifest()));
-
-  app.post('/mcp/v1/rpc', async (req, res) => {
-    const key = req.header('x-boxy-key');
-    const userId = apiKeys.get(key);
-    if (!userId) return res.status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: 'invalid api key' } });
-
-    const { jsonrpc, id, method, params } = req.body || {};
-    if (jsonrpc !== '2.0' || !method) return res.json({ jsonrpc: '2.0', id, error: { code: -32600, message: 'invalid request' } });
-
-    if (method === 'tools/list') return res.json({ jsonrpc: '2.0', id, result: getManifest().tools });
-    if (method === 'tools/call') {
-      const tool = tools.get(params?.name);
-      if (!tool) return res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'unknown tool' } });
-      try {
-        const result = await tool.run({ userId, params: params?.arguments || {} });
-        return res.json({ jsonrpc: '2.0', id, result });
-      } catch (e) {
-        return res.json({ jsonrpc: '2.0', id, error: { code: -32000, message: String(e.message || e) } });
-      }
-    }
-    return res.json({ jsonrpc: '2.0', id, error: { code: -32601, message: 'unknown method' } });
+  app.get('/mcp/v1/manifest', async (req, res) => {
+    const userId = await authByKey(req, res); if (!userId) return;
+    res.json(getManifest());
   });
 
-  app.get('/mcp/v1/sse', (req, res) => {
-    const key = req.query.key;
-    const designId = req.query.designId;
-    const userId = apiKeys.get(key);
-    if (!userId || !designId) return res.status(401).end();
-    const d = store.getDesign(designId, userId);
-    if (!d) return res.status(404).end();
-    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-    res.flushHeaders?.();
-    if (!subscribers.has(designId)) subscribers.set(designId, new Set());
-    subscribers.get(designId).add(res);
-    res.write(`data: ${JSON.stringify({ type: 'hello' })}\n\n`);
-    req.on('close', () => subscribers.get(designId)?.delete(res));
+  app.post('/mcp/v1/rpc', async (req, res) => {
+    const userId = await authByKey(req, res); if (!userId) return;
+    const { id, method, params } = req.body || {};
+    const reply = (result) => res.json({ jsonrpc: '2.0', id, result });
+    const fail  = (code, message) => res.json({ jsonrpc: '2.0', id, error: { code, message } });
+
+    try {
+      if (method === 'tools/list') return reply(getManifest());
+      if (method === 'tools/call') {
+        const tool = tools.get(params?.name);
+        if (!tool) return fail(-32601, `unknown tool: ${params?.name}`);
+        const result = await tool.run({ userId, params: params?.arguments || {} });
+        return reply(result);
+      }
+      return fail(-32601, `unknown method: ${method}`);
+    } catch (e) {
+      return fail(-32000, e.message || String(e));
+    }
+  });
+
+  app.get('/mcp/v1/sse', async (req, res) => {
+    const userId = await authByKey(req, res); if (!userId) return;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    res.write(`event: hello\ndata: ${JSON.stringify({ at: Date.now() })}\n\n`);
+    const set = sseClients.get(userId) || new Set();
+    set.add(res); sseClients.set(userId, set);
+    req.on('close', () => { set.delete(res); });
   });
 }

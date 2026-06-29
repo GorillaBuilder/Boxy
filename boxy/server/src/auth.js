@@ -1,16 +1,21 @@
+// Old-school Google OAuth flow that writes users straight into Supabase.
+// The server is the only thing that touches Supabase Auth-wise — we never
+// involve Supabase Auth itself. Users are rows in public.users keyed by a
+// generated UUID, NOT by auth.users.id.
+
 import jwt from 'jsonwebtoken';
-import { store } from './db.js';
+import { randomUUID } from 'crypto';
+import { supabase } from './db.js';
 
 const {
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
-  SESSION_SECRET = 'dev-secret',
-  SERVER_URL = 'http://localhost:8787',
+  SESSION_SECRET = 'dev-secret-change-me',
   CLIENT_URL = 'http://localhost:5173',
 } = process.env;
 
-// OAuth completes on the client origin (Vite proxies /api -> server) so the cookie
-// lands same-origin with /api/me calls. Override OAUTH_BASE for Codespaces / deploys.
+// OAuth completes on the client origin (Vite proxies /api -> server) so the
+// cookie lands same-origin. Override OAUTH_BASE for Codespaces / deploys.
 const OAUTH_BASE = process.env.OAUTH_BASE || CLIENT_URL;
 const REDIRECT_URI = `${OAUTH_BASE}/api/auth/google/callback`;
 
@@ -47,29 +52,50 @@ export async function exchangeCode(code) {
   return profRes.json();
 }
 
-export function upsertUser(profile) {
-  const existing = store.findUser({ googleId: profile.id, email: profile.email });
+// Upsert user into Supabase public.users. We never touch auth.users — so the
+// schema's FK from public.users.id → auth.users.id must be relaxed (see notes).
+export async function upsertUserManual(profile) {
+  // Try to find existing user by google_id or email.
+  const { data: existing } = await supabase
+    .from('users').select('*')
+    .or(`google_id.eq.${profile.id},email.eq.${profile.email}`)
+    .maybeSingle();
   if (existing) {
-    return store.updateUser(existing.id, {
-      name: profile.name, avatar: profile.picture, googleId: profile.id,
-    });
+    const patch = {
+      name: profile.name,
+      avatar: profile.picture,
+      google_id: profile.id,
+    };
+    const { data, error } = await supabase
+      .from('users').update(patch).eq('id', existing.id).select().single();
+    if (error) throw error;
+    return data;
   }
-  return store.insertUser({
-    googleId: profile.id, email: profile.email, name: profile.name, avatar: profile.picture,
-  });
+  const id = randomUUID();
+  const { data, error } = await supabase
+    .from('users').insert({
+      id,
+      email: profile.email,
+      name: profile.name,
+      avatar: profile.picture,
+      google_id: profile.id,
+    }).select().single();
+  if (error) throw error;
+  return data;
 }
 
 export function issueToken(user) {
   return jwt.sign({ uid: user.id }, SESSION_SECRET, { expiresIn: '30d' });
 }
 
-export function authRequired(req, res, next) {
+export async function authRequired(req, res, next) {
   const token = req.cookies?.boxy_session;
   if (!token) return res.status(401).json({ error: 'unauthenticated' });
   try {
     const { uid } = jwt.verify(token, SESSION_SECRET);
-    const user = store.findUser({ id: uid });
-    if (!user) return res.status(401).json({ error: 'unauthenticated' });
+    const { data: user, error } = await supabase
+      .from('users').select('*').eq('id', uid).maybeSingle();
+    if (error || !user) return res.status(401).json({ error: 'unauthenticated' });
     req.user = { id: user.id, email: user.email, name: user.name, avatar: user.avatar };
     next();
   } catch {

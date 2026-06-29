@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useImperativeHandle, forwardRef, useState } from 'react';
-import { Canvas, useThree } from '@react-three/fiber';
+import { Canvas, useThree, useFrame } from '@react-three/fiber';
 import { OrbitControls, Grid, Environment, ContactShadows } from '@react-three/drei';
 import * as THREE from 'three';
 import { runProgram, boundingBox } from '../engine/kernel';
@@ -13,11 +13,101 @@ export interface ViewerHandle {
   joints: () => JointDef[];
 }
 
+// JointOutlines attaches a wireframe-edges child to every mesh that is the target
+// of a joint. The outline fades in when the joint's value changes (i.e. when the
+// user is holding its key) and fades out a half-second after the key is released.
+function JointOutlines({
+  joints, meshes, virtualGroups,
+}: {
+  joints: JointDef[];
+  meshes: Map<string, THREE.Mesh>;
+  virtualGroups: Map<string, THREE.Group>;
+}) {
+  const outlines = useRef(new Map<string, { line: THREE.LineSegments; mat: THREE.LineBasicMaterial; lastValue: number; lastChanged: number }>());
+
+  // Build/refresh the outline meshes whenever joints or geometry changes.
+  useEffect(() => {
+    // Tear down old outlines.
+    outlines.current.forEach(({ line }) => line.parent?.remove(line));
+    outlines.current.clear();
+
+    const targetIds = new Set(joints.map(j => j.target));
+    const collectMeshes = (id: string): THREE.Mesh[] => {
+      const vg = virtualGroups.get(id);
+      if (vg) {
+        const out: THREE.Mesh[] = [];
+        vg.traverse(o => { if ((o as THREE.Mesh).isMesh) out.push(o as THREE.Mesh); });
+        return out;
+      }
+      const m = meshes.get(id);
+      return m ? [m] : [];
+    };
+
+    for (const id of targetIds) {
+      const ms = collectMeshes(id);
+      for (const mesh of ms) {
+        if (!mesh.geometry) continue;
+        const edges = new THREE.EdgesGeometry(mesh.geometry, 22);
+        const mat = new THREE.LineBasicMaterial({
+          color: new THREE.Color('#a8552c'), // rust
+          transparent: true,
+          opacity: 0,
+          depthTest: false,
+        });
+        const line = new THREE.LineSegments(edges, mat);
+        line.renderOrder = 999;
+        line.name = `__outline_${id}`;
+        mesh.add(line);
+        outlines.current.set(`${id}_${mesh.uuid}`, { line, mat, lastValue: 0, lastChanged: 0 });
+      }
+    }
+    return () => {
+      outlines.current.forEach(({ line }) => line.parent?.remove(line));
+      outlines.current.clear();
+    };
+  }, [joints, meshes, virtualGroups]);
+
+  // Each frame, fade the outline opacity based on whether the joint moved recently.
+  useFrame(() => {
+    const now = performance.now();
+    const activeTargets = new Map<string, number>();
+    for (const j of joints) {
+      const entry = activeTargets.get(j.target) ?? -Infinity;
+      // record when this joint was last seen at a different value
+      const prev = (outlines.current.get(j.target + '__joint') as any)?.lastValue ?? j.value;
+      if (Math.abs(j.value - prev) > 1e-4) {
+        activeTargets.set(j.target, now);
+      } else {
+        activeTargets.set(j.target, entry);
+      }
+      // stash joint value
+      (outlines.current.set(j.target + '__joint', { line: null as any, mat: null as any, lastValue: j.value, lastChanged: now }));
+    }
+
+    outlines.current.forEach((rec, key) => {
+      if (key.endsWith('__joint')) return;
+      const id = key.split('_').slice(0, -1).join('_'); // strip mesh uuid
+      const recent = activeTargets.get(id) ?? -Infinity;
+      const sinceMove = now - recent;
+      // Target opacity: 0.9 while moving, fades to 0 over 600ms.
+      const target = sinceMove < 600 ? Math.max(0, 0.9 * (1 - sinceMove / 600)) : 0;
+      rec.mat.opacity += (target - rec.mat.opacity) * 0.25;
+    });
+  });
+
+  return null;
+}
+
 function Model({ ops, onBuilt }: { ops: BoxyOp[]; onBuilt: (b: any) => void }) {
   const { meshes, groups, virtualGroups, joints, root } = useMemo(() => runProgram(ops), [ops]);
   useRig(joints, meshes, groups, virtualGroups);
   useEffect(() => { onBuilt({ root, joints, meshes, groups, virtualGroups, bbox: boundingBox(root) }); }, [root]);
-  return <primitive object={root} />;
+  return (
+    <>
+      <primitive object={root} />
+      <JointOutlines joints={joints} meshes={meshes} virtualGroups={virtualGroups} />
+    </>
+  );
 }
 
 function Capturer({ apiRef, data }: any) {
@@ -46,7 +136,7 @@ function RigHud({ joints }: { joints: JointDef[] }) {
         <div className="mb-1.5 flex items-center gap-2 text-2xs uppercase tracking-wider text-paper-500">
           <span className="h-1.5 w-1.5 rounded-full bg-olive/80" />
           rig · {joints.length} joint{joints.length > 1 ? 's' : ''}
-          <span className="text-paper-400">· hold key · Shift+key reverses</span>
+          <span className="text-paper-400">· hold key · shift+key reverses</span>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
           {joints.map(j => {
